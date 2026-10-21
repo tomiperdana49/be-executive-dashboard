@@ -17,8 +17,13 @@ export class AuthService implements IAuthService {
         const user = await this.userService.getByEmId(data.employeeId)
         if (!user.is_active) throw new UnauthorizedException('User is not active')
 
-        const authenticated = await this.is5Service.auth(data.employeeId, data.password)
-        if (!authenticated) throw new UnauthorizedException('Invalid credentials')
+        const isDevLogin = config.devLogin.employeeIds.includes(data.employeeId)
+        if (isDevLogin) {
+            console.warn(`[DevLogin] IS5 password check skipped for ${data.employeeId}`)
+        } else {
+            const authenticated = await this.is5Service.auth(data.employeeId, data.password)
+            if (!authenticated) throw new UnauthorizedException('Invalid credentials')
+        }
 
         const { accessToken, refreshToken } = await AuthHelper.generateTokens(user)
         const { password, resetPasswordToken, resetPasswordExpires, ...userWithoutSensitiveData } = user

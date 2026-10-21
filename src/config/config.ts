@@ -57,6 +57,10 @@ export const config = {
     is5: {
         authUrl: process.env.IS5_AUTH_URL || '',
     },
+    devLogin: {
+        // Employee IDs allowed to log in without IS5 password check. Local development only — leave empty elsewhere.
+        employeeIds: (process.env.DEV_LOGIN_EMPLOYEE_IDS || '').split(',').map(id => id.trim()).filter(Boolean),
+    },
     feedback: {
         scriptUrl: process.env.FEEDBACK_URL || '',
     },
