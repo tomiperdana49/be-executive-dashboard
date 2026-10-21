@@ -761,7 +761,10 @@ export class RetentionRepository implements IRetentionRepository {
                 AND c.BranchId = '020'
                 AND ${branch.sql}
                 AND s.ServiceCategory = 'access_business'
-                AND nci.AccCode LIKE '400%'
+                -- Cicilan Perangkat is recurring (counted as New MRC) but booked to 401.xxx
+                AND (nci.AccCode LIKE '400%' OR s.ServiceId = 'CICILALAT')
+                -- BOD is OTC, not New MRC
+                AND LOWER(s.ServiceType) NOT LIKE '%bandwidth on demand%'
                 AND DATE(nci.InsertDate) >= ?
                 AND DATE(nci.InsertDate) <= ?
             ) t

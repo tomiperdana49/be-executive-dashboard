@@ -361,10 +361,14 @@ export class SalesPerformanceRepository implements ISalesPerformanceRepository {
                 SELECT
                     nci.AI AS ai,
                     cs.SalesId AS sales_id,
+                    cit.CustServId AS cust_serv_id,
+                    cit.ServiceId AS service_id,
+                    cit.Date AS inv_order_date,
+                    cit.InvoiceNum AS inv_num,
+                    cit.Urut AS inv_urut,
                     nci.Credit AS credit,
                     IF(cit.InvoiceType != 8, itm.Month, 1) AS inv_period,
-                    IFNULL(nci2.JournalDate, nci2.TransDate) AS paid_date,
-                    ROW_NUMBER() OVER (PARTITION BY cit.CustServId ORDER BY cit.Date ASC) AS rn
+                    IFNULL(nci2.JournalDate, nci2.TransDate) AS paid_date
                 FROM CustomerInvoiceTemp cit
                 LEFT JOIN InvoiceTypeMonth itm ON itm.InvoiceType = cit.InvoiceType
                 LEFT JOIN NewCustomerInvoice nci ON nci.Id = cit.InvoiceNum AND nci.No = cit.Urut
@@ -384,7 +388,9 @@ export class SalesPerformanceRepository implements ISalesPerformanceRepository {
                     AND cit.InvProrata = 0
                     AND c.BranchId = '020'
                     AND s.ServiceCategory = 'access_business'
-                    AND nci.AccCode LIKE '400%'
+                    -- Cicilan Perangkat is recurring (counted as New MRC) but booked to 401.xxx
+                    AND (nci.AccCode LIKE '400%' OR s.ServiceId = 'CICILALAT')
+                    -- BOD is OTC, not New MRC
                     AND LOWER(s.ServiceType) NOT LIKE '%bandwidth on demand%'
             ),
             discount_data AS (
@@ -398,12 +404,29 @@ export class SalesPerformanceRepository implements ISalesPerformanceRepository {
                     ON nci.Id = cid.InvoiceNum AND nci.No = cid.Urut
                 WHERE cit.RInvoiceNum = 0
             ),
-            mrc_data AS (
-                SELECT t.sales_id, DATE(t.paid_date) AS paid_day,
-                    ((t.credit - IFNULL(d.discount, 0)) / 1.11) / NULLIF(t.inv_period, 0) AS amount
+            priced_data AS (
+                SELECT t.*,
+                    ((t.credit - IFNULL(d.discount, 0)) / 1.11) / NULLIF(t.inv_period, 0) AS monthly_amount
                 FROM invoice_data t
                 LEFT JOIN discount_data d ON d.ai = t.ai
-                WHERE t.rn = 1 AND t.paid_date IS NOT NULL
+            ),
+            sequenced_data AS (
+                SELECT p.*,
+                    ROW_NUMBER() OVER (PARTITION BY p.cust_serv_id ORDER BY p.inv_order_date, p.inv_num, p.inv_urut) AS rn,
+                    LAG(p.service_id) OVER (PARTITION BY p.cust_serv_id ORDER BY p.inv_order_date, p.inv_num, p.inv_urut) AS prev_service_id,
+                    LAG(p.monthly_amount) OVER (PARTITION BY p.cust_serv_id ORDER BY p.inv_order_date, p.inv_num, p.inv_urut) AS prev_monthly_amount
+                FROM priced_data p
+            ),
+            mrc_data AS (
+                -- New service: full amount. Upgrade (ServiceId changed to a pricier one): the difference only.
+                SELECT t.sales_id, DATE(t.paid_date) AS paid_day,
+                    IF(t.rn = 1, t.monthly_amount, t.monthly_amount - t.prev_monthly_amount) AS amount
+                FROM sequenced_data t
+                WHERE (
+                        t.rn = 1
+                        OR (t.service_id != t.prev_service_id AND t.monthly_amount > t.prev_monthly_amount)
+                    )
+                    AND t.paid_date IS NOT NULL
                     AND DATE(t.paid_date) BETWEEN ? AND ?
             )
             SELECT

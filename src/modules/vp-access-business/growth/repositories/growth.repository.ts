@@ -33,6 +33,11 @@ export class GrowthRepository implements IGrowthRepository {
             invoice_data AS (
                 SELECT
                     nci.AI AS ai,
+                    cit.CustServId AS cust_serv_id,
+                    cit.ServiceId AS service_id,
+                    cit.Date AS inv_order_date,
+                    cit.InvoiceNum AS inv_num,
+                    cit.Urut AS inv_urut,
                     nci.Credit AS credit,
                     IF(
                         cit.InvoiceType != 8,
@@ -47,11 +52,7 @@ export class GrowthRepository implements IGrowthRepository {
                         nci.InsertDate,
                         nci.Date
                     ) AS inv_date,
-                    nci2.batchNo AS batch_no,
-                    ROW_NUMBER() OVER (
-                        PARTITION BY cit.CustServId
-                        ORDER BY cit.Date ASC
-                    ) AS rn
+                    nci2.batchNo AS batch_no
                 FROM CustomerInvoiceTemp cit
                 CROSS JOIN params p
                 LEFT JOIN InvoiceTypeMonth itm
@@ -85,7 +86,10 @@ export class GrowthRepository implements IGrowthRepository {
                     AND c.BranchId = '020'
                     AND ${branch.sql}
                     AND s.ServiceCategory = 'access_business'
-                    AND nci.AccCode LIKE '400%'
+                    -- Cicilan Perangkat is recurring (counted as New MRC) but booked to 401.xxx
+                    AND (nci.AccCode LIKE '400%' OR s.ServiceId = 'CICILALAT')
+                    -- BOD is OTC, not New MRC
+                    AND LOWER(s.ServiceType) NOT LIKE '%bandwidth on demand%'
             ),
             discount_data AS (
                 SELECT
@@ -103,19 +107,51 @@ export class GrowthRepository implements IGrowthRepository {
                     AND nci.No = cid.Urut
                 WHERE cit.RInvoiceNum = 0
             ),
+            priced_data AS (
+                SELECT
+                    t.*,
+                    (
+                        (t.credit - IFNULL(d.discount, 0)) / 1.11
+                    ) / NULLIF(t.inv_period, 0) AS monthly_amount
+                FROM invoice_data t
+                LEFT JOIN discount_data d
+                    ON d.ai = t.ai
+            ),
+            sequenced_data AS (
+                SELECT
+                    p.*,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY p.cust_serv_id
+                        ORDER BY p.inv_order_date, p.inv_num, p.inv_urut
+                    ) AS rn,
+                    LAG(p.service_id) OVER (
+                        PARTITION BY p.cust_serv_id
+                        ORDER BY p.inv_order_date, p.inv_num, p.inv_urut
+                    ) AS prev_service_id,
+                    LAG(p.monthly_amount) OVER (
+                        PARTITION BY p.cust_serv_id
+                        ORDER BY p.inv_order_date, p.inv_num, p.inv_urut
+                    ) AS prev_monthly_amount
+                FROM priced_data p
+            ),
             mrc_data AS (
+                /* New service: full amount. Upgrade (ServiceId changed to a pricier one): the difference only. */
                 SELECT
                     t.ai,
                     t.paid_date,
                     t.inv_date,
                     t.batch_no,
-                    (
-                        (t.credit - IFNULL(d.discount, 0)) / 1.11
-                    ) / NULLIF(t.inv_period, 0) AS amount
-                FROM invoice_data t
-                LEFT JOIN discount_data d
-                    ON d.ai = t.ai
+                    IF(
+                        t.rn = 1,
+                        t.monthly_amount,
+                        t.monthly_amount - t.prev_monthly_amount
+                    ) AS amount
+                FROM sequenced_data t
                 WHERE t.rn = 1
+                    OR (
+                        t.service_id != t.prev_service_id
+                        AND t.monthly_amount > t.prev_monthly_amount
+                    )
             )
             SELECT
                 /* New MRC yang diambil dari paid saja */
