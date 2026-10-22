@@ -1,4 +1,5 @@
 import { IRetentionRepository } from '../interfaces/retention.repository.interface'
+import { IGrowthRepository } from '../../growth/interfaces/growth.repository.interface'
 import { IRetentionService } from '../interfaces/retention.service.interface'
 import { DateHelper } from '../../../../core/helpers/date'
 import { TrendHelper } from '../../../../core/helpers/trend'
@@ -8,7 +9,11 @@ import { TrendHelper } from '../../../../core/helpers/trend'
  * Responsible for orchestrating data retrieval from repositories and calculating trends/percentages
  */
 export class RetentionService implements IRetentionService {
-    constructor(private readonly retentionRepository: IRetentionRepository) {}
+    constructor(
+        private readonly retentionRepository: IRetentionRepository,
+        // New MRC comes from the growth module so Net MRC matches the Growth dashboard
+        private readonly growthRepository: IGrowthRepository
+    ) {}
 
     /**
      * Calculate churn revenue metrics
@@ -337,8 +342,8 @@ export class RetentionService implements IRetentionService {
             currentNewMrcFull, prevNewMrcFull,
             currentChurnMrc, prevChurnMrc
         ] = await Promise.all([
-            this.retentionRepository.getNewMrc(branchId, startDate, endDate),
-            this.retentionRepository.getNewMrc(branchId, prevStartDate, prevEndDate),
+            this.growthRepository.getNewMrc(branchId, startDate, endDate),
+            this.growthRepository.getNewMrc(branchId, prevStartDate, prevEndDate),
             this.retentionRepository.churnRevenue(branchId, startDate, endDate),
             this.retentionRepository.churnRevenue(branchId, prevStartDate, prevEndDate)
         ])

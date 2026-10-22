@@ -14,42 +14,43 @@ export class RetentionRepository implements IRetentionRepository {
     ) {}
 
     /**
-     * Query churned revenue
-     * Aggregates revenue generated from customer services that are now in 'NA' (churn) status
-     * 
+     * WHERE clause for churned services: status NA with the NA (unreg) date inside the period.
+     * Blocked (BL) services, one-time payment services (InvoiceType 8) and BOD are not churn.
+     * Expects aliases cs (CustomerServices), c (Customer) and s (Services); params: [...branch.params, startDate, endDate].
+     */
+    private churnedServicesWhere(branchSql: string): string {
+        return `cs.CustStatus = 'NA'
+                AND cs.InvoiceType != 8
+                AND LOWER(s.ServiceType) NOT LIKE '%bandwidth on demand%'
+                AND s.ServiceCategory = 'access_business'
+                AND c.BranchId = '020'
+                AND ${branchSql}
+                AND cs.CustUnregDate >= ?
+                AND cs.CustUnregDate < DATE_ADD(?, INTERVAL 1 DAY)`
+    }
+
+    /**
+     * Query churned MRC
+     * Sums the monthly recurring charge of services that went NA (churn) within the period
+     *
      * @param {string} branchId - The branch identifier
      * @param {string} startDate - Query start date
      * @param {string} endDate - Query end date
-     * @returns {Promise<number>} Total revenue lost to churn
+     * @returns {Promise<number>} Total MRC lost to churn
      */
     async churnRevenue(branchId: string, startDate: string, endDate: string): Promise<number> {
         const branch = BranchHelper.displayFilter(branchId)
         const [rows] = await this.nisDb.query<any[]>(
             `SELECT
-                    SUM(gj.Kredit - gj.Debet) total
-                FROM GeneralJournal gj
-                LEFT JOIN Panjar_Penjualan_Breakdown ppb ON
-                    ppb.id = gj.SumberId 
-                    AND gj.Sumber = 'pnjr'
-                LEFT JOIN NewCustomerInvoice nci ON
-                    nci.AI = IFNULL(ppb.invoiceAI, gj.SumberId)
-                LEFT JOIN CustomerInvoiceTemp cit ON
-                    cit.InvoiceNum = nci.Id
-                    AND cit.Urut = nci.No
-                LEFT JOIN CustomerServices cs ON
-                    cs.CustServId = cit.CustServId
+                    SUM((cs.Subscription - CAST(cs.Discount AS UNSIGNED)) / itm.Month) total
+                FROM CustomerServices cs
                 LEFT JOIN Customer c ON
                     c.CustId = cs.CustId
                 LEFT JOIN Services s ON
-                    s.ServiceId = cit.ServiceId
-                WHERE gj.KodeCabang = '020'
-                AND c.BranchId = '020'
-                AND ${branch.sql}
-                AND s.ServiceCategory = 'access_business'
-                AND gj.NoPerkiraan LIKE '400%'
-                AND gj.TglTransaksi >= ?
-                AND gj.TglTransaksi <= ?
-                AND cs.CustStatus = 'NA'
+                    s.ServiceId = cs.ServiceId
+                LEFT JOIN InvoiceTypeMonth itm ON
+                    itm.InvoiceType = cs.InvoiceType
+                WHERE ${this.churnedServicesWhere(branch.sql)}
                 `,
             [...branch.params, startDate, endDate]
         )
@@ -70,7 +71,6 @@ export class RetentionRepository implements IRetentionRepository {
         const date = new Date(startDate)
         const month = String(date.getMonth() + 1).padStart(2, '0')
         const year2 = String(date.getFullYear()).slice(-2)
-        const year4 = String(date.getFullYear())
 
         // Check if querying the current month (snapshot not yet available)
         const now = new Date()
@@ -103,17 +103,10 @@ export class RetentionRepository implements IRetentionRepository {
                             c.CustId = cs.CustId
                         LEFT JOIN Services s ON
                             s.ServiceId = cs.ServiceId
-                        WHERE cs.CustStatus IN ('NA', 'BL')
-                        AND s.ServiceCategory = 'access_business'
-                        AND c.BranchId = '020'
-                        AND ${branch.sql}
-                        AND (
-                            (YEAR(cs.CustUnregDate) = ? AND MONTH(cs.CustUnregDate) = ?)
-                            OR (YEAR(cs.CustBlockDate) = ? AND MONTH(cs.CustBlockDate) = ?)
-                        )
+                        WHERE ${this.churnedServicesWhere(branch.sql)}
                     ) na
                     `,
-                [...branch.params, ...branch.params, year4, month, year4, month]
+                [...branch.params, ...branch.params, startDate, endDate]
             )
             return {
                 rate: Number(rows[0]?.churn_rate || 0),
@@ -122,7 +115,7 @@ export class RetentionRepository implements IRetentionRepository {
             }
         }
 
-        // Use snapshot for past periods
+        // Past periods: active base from the monthly snapshot, churn from services that went NA in that month
         const snapshotPeriod = `${month}${year2}`
 
         const [rows] = await this.nisDb.query<any[]>(
@@ -145,20 +138,16 @@ export class RetentionRepository implements IRetentionRepository {
                 ) ac
                 JOIN (
                     SELECT
-                        COUNT(DISTINCT cse.CustServId) total_churn
-                    FROM CustomerServiceExcerpt cse
+                        COUNT(1) total_churn
+                    FROM CustomerServices cs
                     LEFT JOIN Customer c ON
-                        c.CustId = cse.CustId
+                        c.CustId = cs.CustId
                     LEFT JOIN Services s ON
-                        s.ServiceId = cse.ServiceId
-                    WHERE s.ServiceCategory = 'access_business'
-                    AND c.BranchId = '020'
-                    AND ${branch.sql}
-                    AND cse.Period = ?
-                    AND cse.CustStatus = 'NA'
+                        s.ServiceId = cs.ServiceId
+                    WHERE ${this.churnedServicesWhere(branch.sql)}
                 ) na
                 `,
-            [...branch.params, snapshotPeriod, ...branch.params, snapshotPeriod]
+            [...branch.params, snapshotPeriod, ...branch.params, startDate, endDate]
         )
         return {
             rate: Number(rows[0]?.churn_rate || 0),
@@ -189,17 +178,10 @@ export class RetentionRepository implements IRetentionRepository {
                     s.ServiceId = cs.ServiceId
                 LEFT JOIN ServiceGroup sg ON
                     sg.ServiceGroup = s.ServiceGroup
-                WHERE cs.CustStatus IN ('NA', 'BL')
-                AND s.ServiceCategory = 'access_business'
-                AND c.BranchId = '020'
-                AND ${branch.sql}
-                AND (
-                    (cs.CustUnregDate >= ? AND cs.CustUnregDate <= ?)
-                    OR (cs.CustBlockDate >= ? AND cs.CustBlockDate <= ?)
-                )
+                WHERE ${this.churnedServicesWhere(branch.sql)}
                 GROUP BY s.ServiceGroup, sg.Description
                 `,
-            [...branch.params, startDate, endDate, startDate, endDate]
+            [...branch.params, startDate, endDate]
         )
         return rows
     }
@@ -696,104 +678,6 @@ export class RetentionRepository implements IRetentionRepository {
             [startDate, endDate, ...branch.params]
         )
         return rows.map(r => ({ csid: Number(r.csid), mrc: Number(r.mrc || 0) }))
-    }
-
-    async getNewMrc(branchId: string, startDate: string, endDate: string): Promise<{ mrc: number; mrc_unpaid: number; mrc_paid: number }> {
-        const branch = BranchHelper.displayFilter(branchId)
-        const [rows] = await this.nisDb.query<any[]>(
-            `SELECT
-                COALESCE(SUM(((t.credit - IFNULL(d.discount, 0)) / 1.11) / t.inv_period), 0) AS mrc,
-                COALESCE(SUM(
-                    CASE
-                        WHEN t.batch_no IS NULL
-                        THEN ((t.credit - IFNULL(d.discount, 0)) / 1.11) / t.inv_period
-                        ELSE 0
-                    END
-                ), 0) AS mrc_unpaid,
-                COALESCE(SUM(
-                    CASE
-                        WHEN t.batch_no IS NOT NULL
-                        THEN ((t.credit - IFNULL(d.discount, 0)) / 1.11) / t.inv_period
-                        ELSE 0
-                    END
-                ), 0) AS mrc_paid
-            FROM (
-                SELECT
-                    nci.AI ai,
-                    nci.Credit credit,
-                    IF(
-                        cit.InvoiceType != 8,
-                        itm.Month,
-                        1
-                    ) inv_period,
-                    nci2.batchNo batch_no,
-                    ROW_NUMBER() OVER (
-                        PARTITION BY cit.CustServId
-                    ) AS rn
-                FROM CustomerInvoiceTemp cit
-                LEFT JOIN InvoiceTypeMonth itm
-                    ON itm.InvoiceType = cit.InvoiceType
-                LEFT JOIN NewCustomerInvoice nci 
-                    ON cit.InvoiceNum = nci.Id 
-                    AND cit.Urut = nci.No
-                LEFT JOIN NewCustomerInvoiceBatch ncib 
-                    ON ncib.AI = nci.AI
-                LEFT JOIN (
-                    SELECT 
-                        ncib.batchNo,
-                        nci.*,
-                        ROW_NUMBER() OVER (
-                            PARTITION BY ncib.batchNo 
-                            ORDER BY nci.Date DESC
-                        ) AS RowNum
-                    FROM NewCustomerInvoice nci
-                    LEFT JOIN NewCustomerInvoiceBatch ncib 
-                        ON ncib.AI = nci.AI
-                    WHERE nci.Type LIKE 'RA%'
-                ) nci2 
-                    ON nci2.batchNo = ncib.batchNo
-                LEFT JOIN Services s 
-                    ON s.ServiceId = cit.ServiceId
-                LEFT JOIN Customer c 
-                    ON c.CustId = cit.CustId
-                WHERE cit.RInvoiceNum = 0
-                AND cit.InvProrata = 0
-                AND c.BranchId = '020'
-                AND ${branch.sql}
-                AND s.ServiceCategory = 'access_business'
-                -- Cicilan Perangkat is recurring (counted as New MRC) but booked to 401.xxx
-                AND (nci.AccCode LIKE '400%' OR s.ServiceId = 'CICILALAT')
-                -- BOD is OTC, not New MRC
-                AND LOWER(s.ServiceType) NOT LIKE '%bandwidth on demand%'
-                AND DATE(nci.InsertDate) >= ?
-                AND DATE(nci.InsertDate) <= ?
-            ) t
-            LEFT JOIN (
-                SELECT
-                    nci.AI ai,
-                    ncid.Debet discount
-                FROM CustomerInvoiceDiscount cid
-                LEFT JOIN NewCustomerInvoice ncid 
-                    ON ncid.Id = cid.Id
-                    AND ncid.Type = 'discount'
-                LEFT JOIN CustomerInvoiceTemp cit 
-                    ON cit.InvoiceNum = cid.InvoiceNum
-                    AND cit.Urut = cid.Urut
-                LEFT JOIN NewCustomerInvoice nci 
-                    ON nci.Id = cid.InvoiceNum
-                    AND nci.No = cid.Urut
-                WHERE cit.RInvoiceNum = 0
-            ) d 
-                ON d.ai = t.ai
-            WHERE t.rn = 1;`,
-            [...branch.params, startDate, endDate]
-        )
-
-        return {
-            mrc: Number(rows[0]?.mrc || 0),
-            mrc_unpaid: Number(rows[0]?.mrc_unpaid || 0),
-            mrc_paid: Number(rows[0]?.mrc_paid || 0)
-        }
     }
 
     async getForecastMrc(startDate: string, endDate: string): Promise<number> {
