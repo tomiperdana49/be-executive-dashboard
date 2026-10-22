@@ -45,16 +45,11 @@ export class GrowthRepository implements IGrowthRepository {
                         1
                     ) AS inv_period,
                     IFNULL(
-                        nci2.JournalDate,
-                        nci2.TransDate
-                    ) AS paid_date,
-                    IFNULL(
                         nci.InsertDate,
                         nci.Date
                     ) AS inv_date,
-                    nci2.batchNo AS batch_no
+                    ncib.batchNo AS batch_no
                 FROM CustomerInvoiceTemp cit
-                CROSS JOIN params p
                 LEFT JOIN InvoiceTypeMonth itm
                     ON itm.InvoiceType = cit.InvoiceType
                 LEFT JOIN NewCustomerInvoice nci
@@ -62,21 +57,6 @@ export class GrowthRepository implements IGrowthRepository {
                     AND nci.No = cit.Urut
                 LEFT JOIN NewCustomerInvoiceBatch ncib
                     ON ncib.AI = nci.AI
-                LEFT JOIN (
-                    SELECT
-                        ncib.batchNo,
-                        nci.*,
-                        ROW_NUMBER() OVER (
-                            PARTITION BY ncib.batchNo
-                            ORDER BY nci.Date DESC
-                        ) AS RowNum
-                    FROM NewCustomerInvoice nci
-                    LEFT JOIN NewCustomerInvoiceBatch ncib
-                        ON ncib.AI = nci.AI
-                    WHERE nci.Type LIKE 'RA%'
-                ) nci2
-                    ON nci2.batchNo = ncib.batchNo
-                    AND nci2.RowNum = 1
                 LEFT JOIN Services s
                     ON s.ServiceId = cit.ServiceId
                 LEFT JOIN Customer c
@@ -134,11 +114,9 @@ export class GrowthRepository implements IGrowthRepository {
                     ) AS prev_monthly_amount
                 FROM priced_data p
             ),
-            mrc_data AS (
+            mrc_rows AS (
                 /* New service: full amount. Upgrade (ServiceId changed to a pricier one): the difference only. */
                 SELECT
-                    t.ai,
-                    t.paid_date,
                     t.inv_date,
                     t.batch_no,
                     IF(
@@ -152,6 +130,24 @@ export class GrowthRepository implements IGrowthRepository {
                         t.service_id != t.prev_service_id
                         AND t.monthly_amount > t.prev_monthly_amount
                     )
+            ),
+            mrc_data AS (
+                /* Paid date = latest RA in the invoice's batch, looked up only for New MRC rows
+                   (indexed by batchNo) instead of ranking every RA invoice */
+                SELECT
+                    m.inv_date,
+                    m.amount,
+                    (
+                        SELECT IFNULL(ra.JournalDate, ra.TransDate)
+                        FROM NewCustomerInvoiceBatch rab
+                        JOIN NewCustomerInvoice ra
+                            ON ra.AI = rab.AI
+                        WHERE rab.batchNo = m.batch_no
+                            AND ra.Type LIKE 'RA%'
+                        ORDER BY ra.Date DESC
+                        LIMIT 1
+                    ) AS paid_date
+                FROM mrc_rows m
             )
             SELECT
                 /* New MRC yang diambil dari paid saja */
@@ -648,42 +644,44 @@ export class GrowthRepository implements IGrowthRepository {
                 SUM((t.credit - IFNULL(d.discount, 0)) / 1.11) AS total_dpp
             FROM (
                 SELECT
-                    nci.AI ai,
-                    nci.Credit credit,
-                    MAX(IFNULL(nci2.JournalDate, nci2.TransDate)) receipt_date,
-                    ROW_NUMBER() OVER (
-                        PARTITION BY cit.CustServId
-                    ) AS rn
-                FROM CustomerInvoiceTemp cit
-                LEFT JOIN NewCustomerInvoice nci 
-                    ON cit.InvoiceNum = nci.Id 
-                    AND cit.Urut = nci.No
-                LEFT JOIN NewCustomerInvoiceBatch ncib 
-                    ON ncib.AI = nci.AI
-                LEFT JOIN (
-                    SELECT 
-                        ncib.batchNo,
-                        nci.*,
+                    f.ai,
+                    f.credit,
+                    /* Latest RA date across the invoice's batches, looked up only for first invoices (indexed) */
+                    (
+                        SELECT MAX(IFNULL(ra.JournalDate, ra.TransDate))
+                        FROM NewCustomerInvoiceBatch ib
+                        JOIN NewCustomerInvoiceBatch rab
+                            ON rab.batchNo = ib.batchNo
+                        JOIN NewCustomerInvoice ra
+                            ON ra.AI = rab.AI
+                        WHERE ib.AI = f.ai
+                            AND ra.Type LIKE 'RA%'
+                    ) AS receipt_date
+                FROM (
+                    SELECT
+                        nci.AI ai,
+                        nci.Credit credit,
+                        /* First invoice per service = earliest invoice date (AI breaks ties) */
                         ROW_NUMBER() OVER (
-                            PARTITION BY ncib.batchNo 
-                            ORDER BY nci.Date DESC
-                        ) AS RowNum
-                    FROM NewCustomerInvoice nci
-                    LEFT JOIN NewCustomerInvoiceBatch ncib 
-                        ON ncib.AI = nci.AI
-                    WHERE nci.Type LIKE 'RA%'
-                ) nci2 
-                    ON nci2.batchNo = ncib.batchNo
-                LEFT JOIN Services s 
-                    ON s.ServiceId = cit.ServiceId
-                LEFT JOIN Customer c 
-                    ON c.CustId = cit.CustId
-                WHERE cit.RInvoiceNum = 0
-                AND cit.InvProrata = 0
-                AND c.BranchId = '020'
-                AND ${branch.sql}
-                AND s.ServiceCategory = 'access_business'
-                GROUP BY nci.AI
+                            PARTITION BY cit.CustServId
+                            ORDER BY MIN(cit.Date), nci.AI
+                        ) AS rn
+                    FROM CustomerInvoiceTemp cit
+                    LEFT JOIN NewCustomerInvoice nci
+                        ON cit.InvoiceNum = nci.Id
+                        AND cit.Urut = nci.No
+                    LEFT JOIN Services s
+                        ON s.ServiceId = cit.ServiceId
+                    LEFT JOIN Customer c
+                        ON c.CustId = cit.CustId
+                    WHERE cit.RInvoiceNum = 0
+                    AND cit.InvProrata = 0
+                    AND c.BranchId = '020'
+                    AND ${branch.sql}
+                    AND s.ServiceCategory = 'access_business'
+                    GROUP BY nci.AI
+                ) f
+                WHERE f.rn = 1
             ) t
             LEFT JOIN (
                 SELECT
@@ -700,10 +698,9 @@ export class GrowthRepository implements IGrowthRepository {
                     ON nci.Id = cid.InvoiceNum
                     AND nci.No = cid.Urut
                 WHERE cit.RInvoiceNum = 0
-            ) d 
+            ) d
                 ON d.ai = t.ai
-            WHERE t.rn = 1
-            AND DATE(t.receipt_date) >= ?
+            WHERE DATE(t.receipt_date) >= ?
             AND DATE(t.receipt_date) <= ?`,
             [...branch.params, startDate, endDate]
         )
