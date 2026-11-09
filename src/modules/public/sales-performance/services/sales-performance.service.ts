@@ -115,7 +115,8 @@ export class SalesPerformanceService implements ISalesPerformanceService {
     /**
      * Retrieve the weekly BDE performance summary for access_business sales.
      * The week is Monday-based (Monday of the current week through today) and is
-     * used for the activity count; New MRC and achievement use the current month.
+     * used for the activity count; New MRC and achievement use the last 3 months
+     * (current month + 2 previous), with the monthly target multiplied by 3.
      *
      * @param {number} [managerId] - Optional manager ID to filter staff.
      * @param {string} [branchId] - Optional branch ID to filter staff.
@@ -134,6 +135,9 @@ export class SalesPerformanceService implements ISalesPerformanceService {
         const thisWeekEnd = today
         const monthStart = new Date(now.getFullYear(), now.getMonth(), 1)
         const monthEnd = new Date(now.getFullYear(), now.getMonth() + 1, 0)
+        // New MRC window: last 3 months (current month + 2 previous months)
+        const MRC_MONTHS = 3
+        const mrcStart = new Date(now.getFullYear(), now.getMonth() - (MRC_MONTHS - 1), 1)
 
         const staffList = (await this.repository.getStaffList(managerId, branchId, 'access_business'))
             .filter(s => s.type === 'access_business')
@@ -149,7 +153,7 @@ export class SalesPerformanceService implements ISalesPerformanceService {
 
         const emails = staffList.map(s => s.email).filter(Boolean)
         const [mrc, activity] = await Promise.all([
-            this.repository.getBusinessWeeklyMrc(fmt(monthStart), fmt(monthEnd)),
+            this.repository.getBusinessWeeklyMrc(fmt(mrcStart), fmt(monthEnd)),
             this.repository.getBusinessWeeklyActivity(emails, fmt(thisWeekStart), fmt(thisWeekEnd))
         ])
 
@@ -159,11 +163,12 @@ export class SalesPerformanceService implements ISalesPerformanceService {
         const rows = staffList.map(staff => {
             const m = mrcMap.get(staff.employeeId)
             const a = actMap.get(staff.email)
+            // Note: field name kept for API compatibility; value covers the last 3 months.
             const mrcThisMonth = m?.mrcMonth || 0
             const activityThisWeek = a?.actThisWeek || 0
 
-            // Monthly target per BDE: Medan branches 8.5M, all others 6.5M.
-            const target = /medan/i.test(staff.organizationName) ? 8_500_000 : 6_500_000
+            // Monthly target per BDE: Medan branches 8.5M, all others 6.5M — scaled to the 3-month MRC window.
+            const target = (/medan/i.test(staff.organizationName) ? 8_500_000 : 6_500_000) * MRC_MONTHS
             const achievementPct = target > 0 ? (mrcThisMonth / target) * 100 : null
 
             return {
